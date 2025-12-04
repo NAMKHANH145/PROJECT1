@@ -1,0 +1,264 @@
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+
+// --- DRIVERS ---
+#include "mpu6050.h"
+#include "max30102.h"
+
+// --- AI MODEL ---
+#include "stress_classifier.h"
+
+static const char *TAG = "MAIN_APP";
+
+// ============================================================
+// 1. CẤU HÌNH & ĐỊNH NGHĨA
+// ============================================================
+
+// I2C Pins (ESP32 Classic)
+#define I2C_BUS_0           I2C_NUM_0
+#define I2C_BUS_0_SDA_PIN   GPIO_NUM_21 
+#define I2C_BUS_0_SCL_PIN   GPIO_NUM_22
+#define I2C_BUS_0_FREQ_HZ   100000 
+
+#define I2C_BUS_1           I2C_NUM_1
+#define I2C_BUS_1_SDA_PIN   GPIO_NUM_18
+#define I2C_BUS_1_SCL_PIN   GPIO_NUM_19
+#define I2C_BUS_1_FREQ_HZ   100000 
+
+#define BLINK_GPIO          GPIO_NUM_2 
+
+#define WINDOW_SIZE         1000    
+#define INPUT_CHANNELS      4       
+#define HISTORY_SIZE        5
+
+// --- CÁC NGƯỠNG VẬT LÝ (Rule-based Thresholds) ---
+#define THRESHOLD_IR_ON_HAND    30000.0f // Dưới mức này -> Chưa đeo tay
+#define THRESHOLD_MOTION_LIMIT  2000.0f  // StdDev trên mức này -> Đang vận động mạnh
+
+// Enum trạng thái tín hiệu để code dễ đọc
+typedef enum {
+    SIGNAL_OK = 0,      // Tín hiệu sạch, đủ điều kiện chạy AI
+    SIGNAL_NO_HAND,     // Không phát hiện tay (IR thấp)
+    SIGNAL_HIGH_MOTION  // Rung lắc quá mạnh (IMU biến thiên cao)
+} signal_status_t;
+
+// Buffer toàn cục
+float *buf_ir  = NULL;
+float *buf_ax  = NULL;
+float *buf_ay  = NULL;
+float *buf_az  = NULL;
+float *model_input = NULL; 
+
+float prob_history[HISTORY_SIZE] = {0};
+int history_idx = 0;
+
+// ============================================================
+// 2. CÁC HÀM TOÁN HỌC & XỬ LÝ
+// ============================================================
+
+static void i2c_master_init_all(void) {
+    i2c_config_t conf0 = {.mode = I2C_MODE_MASTER, .sda_io_num = I2C_BUS_0_SDA_PIN, .scl_io_num = I2C_BUS_0_SCL_PIN, .sda_pullup_en = GPIO_PULLUP_ENABLE, .scl_pullup_en = GPIO_PULLUP_ENABLE, .master.clk_speed = I2C_BUS_0_FREQ_HZ};
+    i2c_param_config(I2C_BUS_0, &conf0);
+    i2c_driver_install(I2C_BUS_0, conf0.mode, 0, 0, 0);
+
+    i2c_config_t conf1 = {.mode = I2C_MODE_MASTER, .sda_io_num = I2C_BUS_1_SDA_PIN, .scl_io_num = I2C_BUS_1_SCL_PIN, .sda_pullup_en = GPIO_PULLUP_ENABLE, .scl_pullup_en = GPIO_PULLUP_ENABLE, .master.clk_speed = I2C_BUS_1_FREQ_HZ};
+    i2c_param_config(I2C_BUS_1, &conf1);
+    i2c_driver_install(I2C_BUS_1, conf1.mode, 0, 0, 0);
+}
+
+// Tính độ lệch chuẩn (Std Dev) của dữ liệu thô
+float calculate_raw_std_dev(float *buffer, int length) {
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) sum += buffer[i];
+    float mean = sum / length;
+    float sum_sq_diff = 0.0f;
+    for (int i = 0; i < length; i++) {
+        float diff = buffer[i] - mean;
+        sum_sq_diff += diff * diff;
+    }
+    return sqrtf(sum_sq_diff / length);
+}
+
+// Tính giá trị trung bình
+float calculate_mean(float *buffer, int length) {
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) sum += buffer[i];
+    return sum / length;
+}
+
+void z_score_normalize(float *buffer, int length) {
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) sum += buffer[i];
+    float mean = sum / length;
+    
+    float sum_sq = 0.0f;
+    for (int i = 0; i < length; i++) {
+        float diff = buffer[i] - mean;
+        sum_sq += diff * diff;
+    }
+    float std = sqrtf(sum_sq / length);
+    if (std < 1e-6f) std = 1.0f;
+    for (int i = 0; i < length; i++) buffer[i] = (buffer[i] - mean) / std;
+}
+
+float get_smoothed_prob(float new_prob) {
+    prob_history[history_idx] = new_prob;
+    history_idx = (history_idx + 1) % HISTORY_SIZE;
+    float sum = 0;
+    for (int i = 0; i < HISTORY_SIZE; i++) sum += prob_history[i];
+    return sum / HISTORY_SIZE;
+}
+
+// ============================================================
+// 3. HÀM ĐỘC LẬP: KIỂM TRA CHẤT LƯỢNG TÍN HIỆU (Rule-Based)
+// ============================================================
+/**
+ * @brief Kiểm tra các điều kiện vật lý xem tín hiệu có đủ chuẩn để chạy AI không.
+ * @return SIGNAL_OK nếu tốt, mã lỗi nếu không đạt.
+ */
+signal_status_t validate_signal_quality(float *ir_data, float *ax, float *ay, float *az, int len) {
+    
+    // 1. KIỂM TRA TIẾP XÚC DA (Dựa trên cường độ hồng ngoại trung bình)
+    float avg_ir = calculate_mean(ir_data, len);
+    // In ra để debug ngưỡng
+    // printf("Debug IR DC: %.0f\n", avg_ir); 
+    
+    if (avg_ir < THRESHOLD_IR_ON_HAND) {
+        return SIGNAL_NO_HAND;
+    }
+
+    // 2. KIỂM TRA ĐỘNG LỰC HỌC (Dựa trên độ biến thiên gia tốc)
+    float std_ax = calculate_raw_std_dev(ax, len);
+    float std_ay = calculate_raw_std_dev(ay, len);
+    float std_az = calculate_raw_std_dev(az, len);
+    
+    // Tìm trục rung mạnh nhất
+    float max_vibration = fmaxf(std_ax, fmaxf(std_ay, std_az));
+    // printf("Debug Vibration: %.0f\n", max_vibration);
+
+    if (max_vibration > THRESHOLD_MOTION_LIMIT) {
+        return SIGNAL_HIGH_MOTION;
+    }
+
+    // Nếu qua được cả 2 cửa ải trên -> Tín hiệu SẠCH
+    return SIGNAL_OK;
+}
+
+// ============================================================
+// 4. TASK CHÍNH
+// ============================================================
+static void sensor_read_task(void *pvParameters)
+{
+    mpu6050_raw_data_t mpu_data;
+    max30102_data_t max_data;
+    int sample_count = 0;
+    int led_state = 0;
+
+    ESP_LOGI(TAG, "System Optimized. Ready...");
+
+    while (1)
+    {
+        // --- Thu thập dữ liệu ---
+        if (mpu6050_read_raw_data(I2C_BUS_1, &mpu_data) != ESP_OK) {
+            mpu_data.accel_x = 0; mpu_data.accel_y = 0; mpu_data.accel_z = 0;
+        }
+        if (max30102_read_fifo(I2C_BUS_0, &max_data) != ESP_OK) {
+            max_data.ir = 0;
+        }
+
+        buf_ir[sample_count]  = (float)max_data.ir;
+        buf_ax[sample_count]  = (float)mpu_data.accel_x;
+        buf_ay[sample_count]  = (float)mpu_data.accel_y;
+        buf_az[sample_count]  = (float)mpu_data.accel_z;
+        
+        sample_count++;
+
+        if (sample_count % 100 == 0) { printf("."); fflush(stdout); }
+
+        // --- Xử lý mỗi 10 giây ---
+        if (sample_count >= WINDOW_SIZE) {
+            printf("\n");
+            int64_t t1 = esp_timer_get_time();
+
+            // --- BƯỚC 1: GỌI HÀM KIỂM TRA CHẤT LƯỢNG ---
+            signal_status_t sig_status = validate_signal_quality(buf_ir, buf_ax, buf_ay, buf_az, WINDOW_SIZE);
+
+            // --- BƯỚC 2: XỬ LÝ KẾT QUẢ KIỂM TRA ---
+            if (sig_status != SIGNAL_OK) {
+                // Nếu tín hiệu xấu -> Reset bộ lọc Stress về 0 để tránh báo ảo
+                get_smoothed_prob(0.0f);
+
+                if (sig_status == SIGNAL_NO_HAND) {
+                    ESP_LOGW(TAG, "🛑 LOI: KHONG DEO TAY (Check Sensor)");
+                } 
+                else if (sig_status == SIGNAL_HIGH_MOTION) {
+                    ESP_LOGW(TAG, "🛑 LOI: DANG VAN DONG MANH (Please sit still)");
+                }
+            }
+            else {
+                // --- BƯỚC 3: TÍN HIỆU TỐT -> CHẠY AI STRESS ---
+                
+                // A. Chuẩn hóa Z-Score (Chỉ làm khi tín hiệu tốt để tiết kiệm CPU)
+                z_score_normalize(buf_ir, WINDOW_SIZE);
+                z_score_normalize(buf_ax, WINDOW_SIZE);
+                z_score_normalize(buf_ay, WINDOW_SIZE);
+                z_score_normalize(buf_az, WINDOW_SIZE);
+
+                // B. Gộp kênh
+                for (int i = 0; i < WINDOW_SIZE; i++) {
+                    model_input[i*4 + 0] = buf_ir[i];
+                    model_input[i*4 + 1] = buf_ax[i];
+                    model_input[i*4 + 2] = buf_ay[i];
+                    model_input[i*4 + 3] = buf_az[i];
+                }
+
+                // C. Chạy Model
+                float probs[2];
+                if (stress_model_predict(model_input, probs) != -1) {
+                    float avg_stress = get_smoothed_prob(probs[1]);
+                    const char* status = (avg_stress > 0.6f) ? "STRESS !!!" : "OK";
+                    
+                    int64_t t2 = esp_timer_get_time();
+                    ESP_LOGI(TAG, "✅ DO XONG | Stress: %.0f%% (Avg: %.0f%%) | KET QUA: %s | Time: %lld ms",
+                             probs[1]*100, avg_stress*100, status, (t2-t1)/1000);
+                }
+            }
+            
+            ESP_LOGI(TAG, "Free RAM: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            sample_count = 0;
+        }
+
+        gpio_set_level(BLINK_GPIO, led_state);
+        led_state = !led_state;
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
+void app_main(void)
+{
+    // Cấp phát 
+    buf_ir  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_ax  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_ay  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_az  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    model_input = (float*)calloc(WINDOW_SIZE * INPUT_CHANNELS, sizeof(float));
+
+    if (!buf_ir || !model_input) { ESP_LOGE(TAG, "OOM!"); return; }
+
+    gpio_reset_pin(BLINK_GPIO); gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+
+    i2c_master_init_all();
+    max30102_init(I2C_BUS_0);
+    mpu6050_init(I2C_BUS_1);
+    
+    stress_model_init();
+
+    xTaskCreate(sensor_read_task, "sensor_read", 8192, NULL, 5, NULL);
+}

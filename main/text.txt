@@ -1,0 +1,116 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h" // Dùng esp_log.h
+#include "driver/i2c.h"
+
+// BAO GỒM CẢ 2 DRIVER
+#include "mpu6050.h"
+#include "max30102.h"
+
+static const char *TAG = "SENSOR_TEST";
+
+// --- Cấu hình Bus 0 (MAX30102 #1) ---
+#define I2C_BUS_0           I2C_NUM_0
+#define I2C_BUS_0_SCL_PIN   GPIO_NUM_22 // Chân 22
+#define I2C_BUS_0_SDA_PIN   GPIO_NUM_21 // Chân 21
+#define I2C_BUS_0_FREQ_HZ   100000 
+
+// --- Cấu hình Bus 1 (MPU6050) ---
+#define I2C_BUS_1           I2C_NUM_1
+#define I2C_BUS_1_SCL_PIN   GPIO_NUM_19 // Chân 19
+#define I2C_BUS_1_SDA_PIN   GPIO_NUM_18 // Chân 18
+#define I2C_BUS_1_FREQ_HZ   100000
+
+/**
+ * @brief Khởi tạo I2C Bus 0
+ */
+static void i2c_bus_0_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_BUS_0_SDA_PIN,
+        .scl_io_num = I2C_BUS_0_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_BUS_0_FREQ_HZ,
+    };
+    i2c_param_config(I2C_BUS_0, &conf);
+    i2c_driver_install(I2C_BUS_0, conf.mode, 0, 0, 0);
+    ESP_LOGI(TAG, "I2C Bus 0 (MAX30102) đã khởi tạo (SDA: %d, SCL: %d)", I2C_BUS_0_SDA_PIN, I2C_BUS_0_SCL_PIN);
+}
+
+/**
+ * @brief Khởi tạo I2C Bus 1
+ */
+static void i2c_bus_1_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_BUS_1_SDA_PIN,
+        .scl_io_num = I2C_BUS_1_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_BUS_1_FREQ_HZ,
+    };
+    i2c_param_config(I2C_BUS_1, &conf);
+    i2c_driver_install(I2C_BUS_1, conf.mode, 0, 0, 0);
+    ESP_LOGI(TAG, "I2C Bus 1 (MPU6050) đã khởi tạo (SDA: %d, SCL: %d)", I2C_BUS_1_SDA_PIN, I2C_BUS_1_SCL_PIN);
+}
+
+/**
+ * @brief Task chính đọc dữ liệu từ tất cả 2 cảm biến
+ */
+static void sensor_read_task(void *pvParameters)
+{
+    // Biến để chứa dữ liệu thô
+    mpu6050_raw_data_t mpu_data;
+    max30102_data_t max_data;
+    esp_err_t err_mpu;
+    esp_err_t err_max;
+
+    while (1)
+    {
+        ESP_LOGI(TAG, "--- Bắt đầu chu kỳ đọc ---");
+
+        // 1. Đọc MPU6050 (trên Bus 1)
+        err_mpu = mpu6050_read_raw_data(I2C_BUS_1, &mpu_data);
+        if (err_mpu == ESP_OK) {
+            ESP_LOGI(TAG, "MPU6050 (Bus 1): Accel(X:%d, Y:%d, Z:%d)",
+                     mpu_data.accel_x, mpu_data.accel_y, mpu_data.accel_z);
+        } else {ESP_LOGE(TAG, "MPU6050 Lỗi: %s", esp_err_to_name(err_mpu));
+            ESP_LOGE(TAG, "MPU6050 (Bus 1): LỖI ĐỌC DỮ LIỆU");
+        }
+
+        // 2. Đọc MAX30102 #1 (trên Bus 0)
+        err_max = max30102_read_fifo(I2C_BUS_0, &max_data);
+        if (err_max == ESP_OK) {
+            ESP_LOGI(TAG, "MAX30102 (Bus 0): IR=%lu, RED=%lu", max_data.ir, max_data.red);
+        } else if (err_max == ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "MAX30102 (Bus 0): FIFO rỗng.");
+        } else {
+            ESP_LOGE(TAG, "MAX30102 (Bus 0): LỖI ĐỌC DỮ LIỆU");
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "--- CHƯƠG TRÌNH TEST 2 CẢM BIẾN ---");
+    
+    // Khởi tạo 2 bus I2C
+    i2c_bus_0_init();
+    i2c_bus_1_init();
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "Khởi tạo các cảm biến...");
+
+    // Khởi tạo MAX30102 trên Bus 0
+    max30102_init(I2C_BUS_0);
+
+    // Khởi tạo MPU6050 trên Bus 1
+    mpu6050_init(I2C_BUS_1);
+
+    ESP_LOGI(TAG, "Tạo task đọc cảm biến...");
+    xTaskCreate(sensor_read_task, "sensor_read_task", 4096, NULL, 5, NULL);
+}

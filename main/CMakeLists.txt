@@ -1,0 +1,25 @@
+
+   idf_component_register(
+       SRCS
+        "main.c"
+        "algorithms.c"
+        "respiration_estimator.c"
+        "signal_filters.c"
+        "tinyml_manager.cc"
+        "ui.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_timer
+        driver
+        heap
+        mpu6050
+        max30102
+        max30205
+        log
+        lvgl
+        nvs_flash
+        espressif__esp-tflite-micro
+        esp_lcd
+        espressif__esp-dsp
+)

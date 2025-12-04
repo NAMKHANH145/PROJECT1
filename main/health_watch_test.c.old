@@ -1,0 +1,125 @@
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+
+// --- DRIVERS (Chỉ cần MAX30102) ---
+#include "max30102.h" 
+
+// --- AI MODEL (Denoise Model) ---
+#include "denoise_classifier.h" // Sử dụng model HR Estimation mới
+
+static const char *TAG = "HR_DENOISE_TEST";
+
+// ============================================================
+// 1. CẤU HÌNH VÀ BUFFER
+// ============================================================
+
+// I2C Pins (Chỉ cần Bus 0 cho MAX30102)
+#define I2C_BUS_0           I2C_NUM_0
+#define I2C_BUS_0_SDA_PIN   GPIO_NUM_21 
+#define I2C_BUS_0_SCL_PIN   GPIO_NUM_22
+#define I2C_BUS_0_FREQ_HZ   100000 
+
+#define WINDOW_SIZE         1000    // 10 giây @ 100Hz
+#define INPUT_CHANNELS      1       // Chỉ dùng PPG (IR)
+
+// Buffer toàn cục (Chỉ cần IR)
+float *buf_ir = NULL;
+
+// ============================================================
+// 2. CÁC HÀM HỖ TRỢ
+// ============================================================
+
+static void i2c_master_init_bus0(void) {
+    i2c_config_t conf0 = {.mode = I2C_MODE_MASTER, .sda_io_num = I2C_BUS_0_SDA_PIN, .scl_io_num = I2C_BUS_0_SCL_PIN, .sda_pullup_en = GPIO_PULLUP_ENABLE, .scl_pullup_en = GPIO_PULLUP_ENABLE, .master.clk_speed = I2C_BUS_0_FREQ_HZ};
+    i2c_param_config(I2C_BUS_0, &conf0);
+    i2c_driver_install(I2C_BUS_0, conf0.mode, 0, 0, 0);
+}
+
+// Hàm Z-Score (Chỉ cho kênh đơn)
+void z_score_normalize(float *buffer, int length) {
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) sum += buffer[i];
+    float mean = sum / length;
+    
+    float sum_sq = 0.0f;
+    for (int i = 0; i < length; i++) {
+        float diff = buffer[i] - mean;
+        sum_sq += diff * diff;
+    }
+    float std = sqrtf(sum_sq / length);
+    if (std < 1e-6f) std = 1.0f;
+    for (int i = 0; i < length; i++) buffer[i] = (buffer[i] - mean) / std;
+}
+
+// ============================================================
+// 3. TASK CHÍNH (HR Estimation)
+// ============================================================
+static void hr_denoise_task(void *pvParameters)
+{
+    max30102_data_t max_data;
+    int sample_count = 0;
+
+    ESP_LOGI(TAG, "TASK 1A: Bat dau do nhịp tim (PPG -> BPM) @ 100Hz...");
+
+    while (1)
+    {
+        // 1. Đọc cảm biến
+        if (max30102_read_fifo(I2C_BUS_0, &max_data) != ESP_OK) {
+             max_data.ir = 0; // Gán 0 nếu lỗi
+        }
+
+        // 2. Lưu buffer
+        buf_ir[sample_count] = (float)max_data.ir;
+        sample_count++;
+
+        if (sample_count % 100 == 0) { printf("."); fflush(stdout); }
+
+        // 3. Xử lý AI mỗi 10 giây
+        if (sample_count >= WINDOW_SIZE) {
+            printf("\n");
+            int64_t t1 = esp_timer_get_time();
+
+            // A. Chuẩn hóa Z-Score cho PPG (Input của Model)
+            z_score_normalize(buf_ir, WINDOW_SIZE);
+            
+            // B. Chạy Model Denoise/Segmentation và tính BPM
+            int bpm = denoise_model_predict_bpm(buf_ir);
+            
+            int64_t t2 = esp_timer_get_time();
+
+            // 4. In kết quả
+            ESP_LOGI(TAG, "TIME: %lld ms | BPM: %d", 
+                     (t2 - t1)/1000, bpm);
+            ESP_LOGI(TAG, "Free RAM: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            
+            // Reset
+            sample_count = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
+void app_main(void)
+{
+    // 1. Cấp phát Buffer (1000 float)
+    buf_ir  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    if (!buf_ir) { ESP_LOGE(TAG, "OOM Error!"); return; }
+
+    // 2. Init Drivers
+    i2c_master_init_bus0(); // Chỉ init Bus 0
+    max30102_init(I2C_BUS_0);
+    
+    // 3. Init Denoise Model
+    denoise_model_init();
+
+    // 4. Start Task
+    xTaskCreate(hr_denoise_task, "hr_denoise", 8192, NULL, 5, NULL);
+}
