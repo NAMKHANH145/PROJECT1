@@ -1,0 +1,30 @@
+
+   idf_component_register(
+       SRCS
+        "main.c"
+        "algorithms.c"
+        "signal_filters.c"
+        "tinyml_manager.cc"
+        "ui.c"
+        "ble_server.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+    spi_flash 
+    
+    esp_psram
+        esp_timer
+        driver
+        heap
+        mpu6050
+        max30102
+        max30205
+        log
+        lvgl
+        nvs_flash
+        espressif__esp-tflite-micro
+        esp_lcd
+        espressif__esp-dsp
+        esp_adc
+        bt
+)

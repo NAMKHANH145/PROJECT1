@@ -1,0 +1,245 @@
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"      // Đo thời gian
+#include "esp_heap_caps.h"  // Kiểm tra RAM
+
+// --- CÁC THƯ VIỆN DRIVER & AI ---
+#include "mpu6050.h"
+#include "max30102.h"
+#include "stress_classifier.h"
+
+static const char *TAG = "MAIN_APP";
+
+// ============================================================
+// 1. CẤU HÌNH PHẦN CỨNG (ESP32 WROOM / CLASSIC)
+// ============================================================
+
+// Bus 0: MAX30102 (SDA=21, SCL=22 - Mặc định chuẩn)
+#define I2C_BUS_0           I2C_NUM_0
+#define I2C_BUS_0_SDA_PIN   GPIO_NUM_21 
+#define I2C_BUS_0_SCL_PIN   GPIO_NUM_22
+#define I2C_BUS_0_FREQ_HZ   100000 
+
+// Bus 1: MPU6050 (SDA=18, SCL=19)
+#define I2C_BUS_1           I2C_NUM_1
+#define I2C_BUS_1_SDA_PIN   GPIO_NUM_18
+#define I2C_BUS_1_SCL_PIN   GPIO_NUM_19
+#define I2C_BUS_1_FREQ_HZ   100000 
+
+// Debug LED (GPIO 2 là đèn xanh trên board ESP32)
+#define BLINK_GPIO          GPIO_NUM_2
+
+// ============================================================
+// 2. CẤU HÌNH AI & XỬ LÝ TÍN HIỆU
+// ============================================================
+#define WINDOW_SIZE         1000    // 1000 mẫu (10 giây @ 100Hz)
+#define INPUT_CHANNELS      4       // [PPG, Ax, Ay, Az]
+#define HISTORY_SIZE        5       // Lưu 5 kết quả gần nhất để làm mượt
+
+// Biến toàn cục (Cấp phát Heap để tránh tràn Stack)
+float *buf_ppg = NULL;
+float *buf_ax  = NULL;
+float *buf_ay  = NULL;
+float *buf_az  = NULL;
+float *model_input = NULL; 
+
+// Biến cho bộ lọc trung bình trượt (Smoothing Filter)
+float prob_history[HISTORY_SIZE] = {0};
+int history_idx = 0;
+
+// ============================================================
+// 3. CÁC HÀM HỖ TRỢ
+// ============================================================
+
+// Khởi tạo Bus I2C
+static void i2c_master_init_all(void) {
+    // Bus 0
+    i2c_config_t conf0 = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_BUS_0_SDA_PIN,
+        .scl_io_num = I2C_BUS_0_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_BUS_0_FREQ_HZ,
+    };
+    i2c_param_config(I2C_BUS_0, &conf0);
+    i2c_driver_install(I2C_BUS_0, conf0.mode, 0, 0, 0);
+
+    // Bus 1
+    i2c_config_t conf1 = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_BUS_1_SDA_PIN,
+        .scl_io_num = I2C_BUS_1_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_BUS_1_FREQ_HZ,
+    };
+    i2c_param_config(I2C_BUS_1, &conf1);
+    i2c_driver_install(I2C_BUS_1, conf1.mode, 0, 0, 0);
+}
+
+// Hàm Z-Score: Chuẩn hóa dữ liệu về dạng (Mean=0, Std=1)
+void z_score_normalize(float *buffer, int length) {
+    float sum = 0.0f, sum_sq = 0.0f;
+    // Tính Mean
+    for (int i = 0; i < length; i++) sum += buffer[i];
+    float mean = sum / length;
+    
+    // Tính Std Dev
+    for (int i = 0; i < length; i++) {
+        float diff = buffer[i] - mean;
+        sum_sq += diff * diff;
+    }
+    float std = sqrtf(sum_sq / length);
+    if (std < 1e-6f) std = 1.0f; // Tránh chia cho 0
+
+    // Chuẩn hóa
+    for (int i = 0; i < length; i++) buffer[i] = (buffer[i] - mean) / std;
+}
+
+// Hàm làm mượt kết quả (Moving Average)
+float get_smoothed_prob(float new_prob) {
+    prob_history[history_idx] = new_prob;
+    history_idx = (history_idx + 1) % HISTORY_SIZE;
+
+    float sum = 0;
+    for (int i = 0; i < HISTORY_SIZE; i++) sum += prob_history[i];
+    return sum / HISTORY_SIZE;
+}
+
+// ============================================================
+// 4. TASK CHÍNH (Vòng lặp vô tận)
+// ============================================================
+static void sensor_read_task(void *pvParameters)
+{
+    mpu6050_raw_data_t mpu_data;
+    max30102_data_t max_data;
+    int sample_count = 0;
+    int led_state = 0;
+
+    ESP_LOGI(TAG, "=== HE THONG DA SAN SANG (100Hz) ===");
+
+    while (1)
+    {
+        // --- A. ĐỌC CẢM BIẾN ---
+        // MPU6050
+        if (mpu6050_read_raw_data(I2C_BUS_1, &mpu_data) != ESP_OK) {
+            mpu_data.accel_x = 0; mpu_data.accel_y = 0; mpu_data.accel_z = 0;
+        }
+        // MAX30102
+        if (max30102_read_fifo(I2C_BUS_0, &max_data) != ESP_OK) {
+            max_data.ir = 0; 
+        }
+
+        // --- B. LƯU VÀO BUFFER ---
+        buf_ppg[sample_count] = (float)max_data.ir;
+        buf_ax[sample_count]  = (float)mpu_data.accel_x;
+        buf_ay[sample_count]  = (float)mpu_data.accel_y;
+        buf_az[sample_count]  = (float)mpu_data.accel_z;
+        
+        sample_count++;
+
+        // DEBUG: In dấu chấm mỗi 1 giây (100 mẫu) để biết mạch còn sống
+        if (sample_count % 100 == 0) {
+            printf(".");
+            fflush(stdout);
+        }
+
+        // --- C. XỬ LÝ AI KHI ĐỦ 10 GIÂY ---
+        if (sample_count >= WINDOW_SIZE) {
+            printf("\n"); // Xuống dòng
+            
+            // 1. Bắt đầu đo thời gian
+            int64_t start_time = esp_timer_get_time();
+
+            // 2. Chuẩn hóa Z-Score riêng từng kênh
+            z_score_normalize(buf_ppg, WINDOW_SIZE);
+            z_score_normalize(buf_ax, WINDOW_SIZE);
+            z_score_normalize(buf_ay, WINDOW_SIZE);
+            z_score_normalize(buf_az, WINDOW_SIZE);
+
+            // 3. Gộp kênh (Interleaving) để khớp Input Model
+            for (int i = 0; i < WINDOW_SIZE; i++) {
+                model_input[i * 4 + 0] = buf_ppg[i];
+                model_input[i * 4 + 1] = buf_ax[i];
+                model_input[i * 4 + 2] = buf_ay[i];
+                model_input[i * 4 + 3] = buf_az[i];
+            }
+
+            // 4. Chạy Model (Inference)
+            float probs[2];
+            stress_model_predict(model_input, probs);
+            
+            // 5. Hậu xử lý (Smoothing Filter)
+            float raw_prob = probs[1];
+            float smooth_prob = get_smoothed_prob(raw_prob);
+            
+            // Ngưỡng quyết định: > 60% là Stress
+            const char* status = (smooth_prob > 0.6f) ? "STRESS !!!" : "OK";
+
+            // 6. Kết thúc đo thời gian
+            int64_t end_time = esp_timer_get_time();
+            
+            // 7. In kết quả chi tiết
+            ESP_LOGI(TAG, "AI Time: %lld ms | Raw: %.0f%% -> Avg: %.0f%% | KET QUA: %s", 
+                     (end_time - start_time)/1000,
+                     raw_prob * 100,
+                     smooth_prob * 100,
+                     status);
+            
+            // 8. Kiểm tra RAM (Phát hiện Memory Leak)
+            ESP_LOGI(TAG, "Free RAM: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+
+            // Reset biến đếm
+            sample_count = 0;
+        }
+
+        // --- D. WATCHDOG MỀM ---
+        gpio_set_level(BLINK_GPIO, led_state);
+        led_state = !led_state;
+
+        // --- E. GIỮ NHỊP 100Hz ---
+        vTaskDelay(pdMS_TO_TICKS(10)); 
+    }
+}
+
+// ============================================================
+// 5. APP MAIN
+// ============================================================
+void app_main(void)
+{
+    // 1. Cấp phát RAM cho các Buffer (Khoảng 36KB)
+    buf_ppg = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_ax  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_ay  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    buf_az  = (float*)calloc(WINDOW_SIZE, sizeof(float));
+    model_input = (float*)calloc(WINDOW_SIZE * INPUT_CHANNELS, sizeof(float));
+
+    if (!buf_ppg || !model_input) {
+        ESP_LOGE(TAG, "Loi nghiem trong: Khong du RAM!");
+        return;
+    }
+
+    // 2. Cấu hình LED Watchdog
+    gpio_reset_pin(BLINK_GPIO);
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+
+    // 3. Khởi tạo Phần cứng
+    i2c_master_init_all();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    max30102_init(I2C_BUS_0);
+    mpu6050_init(I2C_BUS_1);
+    
+    // 4. Khởi tạo AI
+    stress_model_init();
+
+    // 5. Chạy Task
+    // Tăng Stack lên 8192 để an toàn cho TFLite
+    xTaskCreate(sensor_read_task, "sensor_read", 8192, NULL, 5, NULL);
+}
